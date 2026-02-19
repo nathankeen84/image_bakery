@@ -1,0 +1,178 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - images
+      - shared
+      - terraform
+      - pipelines
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  PACKER_VERSION: '1.15.0'
+  TERRAFORM_VERSION: '1.5.0'
+  CHECKOV_VERSION: 'latest'
+  buildConfiguration: 'Release'
+
+stages:
+  - stage: Validation
+    displayName: 'Validate & Scan'
+    jobs:
+      - job: PackerValidation
+        displayName: 'Validate Packer Templates'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.x'
+          
+          - script: |
+              packer version
+              packer validate -var-file=shared/variables/common.pkrvars.hcl images/ubuntu/cis1/ubuntu-cis1.pkr.hcl
+            displayName: 'Validate Ubuntu CIS L1 Template'
+            continueOnError: 'false'
+
+      - job: TerraformValidation
+        displayName: 'Validate Terraform'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              terraform -version
+              cd terraform
+              terraform init
+              terraform validate
+              terraform fmt -check -recursive
+            displayName: 'Validate Terraform Configuration'
+            continueOnError: 'false'
+
+      - job: SecurityScan
+        displayName: 'Checkov Security Scan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              pip install checkov
+              checkov -d . --framework terraform,packer --output cli
+            displayName: 'Run Checkov Security Scan'
+            continueOnError: 'true'
+
+      - job: ShellLinting
+        displayName: 'Lint Shell Scripts'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              sudo apt-get install -y shellcheck
+              shellcheck -x -S warning shared/scripts/**/*.sh
+            displayName: 'Lint Shell Scripts with ShellCheck'
+            continueOnError: 'true'
+
+  - stage: Documentation
+    displayName: 'Documentation'
+    dependsOn: Validation
+    condition: succeeded()
+    jobs:
+      - job: ValidateDocumentation
+        displayName: 'Validate Documentation'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              echo "Checking for required documentation files..."
+              test -f README.md || (echo "Missing root README.md" && exit 1)
+              test -f images/ubuntu/README.md || (echo "Missing Ubuntu README.md" && exit 1)
+              echo "Documentation validation passed"
+            displayName: 'Check Documentation Completeness'
+
+  - stage: Build
+    displayName: 'Build Images'
+    dependsOn: Documentation
+    condition: succeeded()
+    jobs:
+      - job: BuildUbuntuCIS1
+        displayName: 'Build Ubuntu 22.04 CIS L1'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              echo "Configuring Packer with Azure credentials..."
+              export ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+              export ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+              export ARM_TENANT_ID=$(ARM_TENANT_ID)
+              export ARM_SUBSCRIPTION_ID=$(AZURE_SUBSCRIPTION_ID)
+            displayName: 'Setup Azure Credentials'
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+              AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+
+          - script: |
+              cd images/ubuntu/cis1
+              packer build \
+                -var-file=../../../shared/variables/common.pkrvars.hcl \
+                -var "client_id=$(ARM_CLIENT_ID)" \
+                -var "client_secret=$(ARM_CLIENT_SECRET)" \
+                -var "tenant_id=$(ARM_TENANT_ID)" \
+                -var "subscription_id=$(AZURE_SUBSCRIPTION_ID)" \
+                ubuntu-cis1.pkr.hcl
+            displayName: 'Build Ubuntu CIS L1 Image'
+            env:
+              ARM_CLIENT_ID: $(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET: $(ARM_CLIENT_SECRET)
+              ARM_TENANT_ID: $(ARM_TENANT_ID)
+              AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+            condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+
+  - stage: Infrastructure
+    displayName: 'Infrastructure Deployment'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: TerraformPlan
+        displayName: 'Terraform Plan'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - script: |
+              cd terraform
+              terraform init \
+                -backend-config="subscription_id=$(AZURE_SUBSCRIPTION_ID)" \
+                -backend-config="resource_group_name=terraform-state-rg" \
+                -backend-config="storage_account_name=tfstate$(RANDOM)" \
+                -backend-config="container_name=tfstate" \
+                -backend-config="key=image-bakery.tfstate"
+              terraform plan \
+                -var "subscription_id=$(AZURE_SUBSCRIPTION_ID)" \
+                -out=tfplan
+            displayName: 'Plan Terraform Changes'
+            env:
+              AZURE_SUBSCRIPTION_ID: $(AZURE_SUBSCRIPTION_ID)
+            condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+
+  - stage: Publish
+    displayName: 'Publish Artifacts'
+    dependsOn: Infrastructure
+    condition: succeeded()
+    jobs:
+      - job: PublishBuildArtifacts
+        displayName: 'Publish Build Artifacts'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'image-bakery-artifacts'
+              publishLocation: 'Container'
+            condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')

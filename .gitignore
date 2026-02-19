@@ -1,0 +1,47 @@
+# Secrets and Credentials
+terraform/secrets.tfvars
+terraform/secrets.tfvars.json
+terraform/.terraform/
+terraform/tfplan
+.env
+.env.local
+.env.*.local
+
+# Sensitive files
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+packer-manifest.json
+output-*
+*.box
+*.iso
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# Logs
+*.log
+packer-debug.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
